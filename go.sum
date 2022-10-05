@@ -1,0 +1,6 @@
+github.com/brianvoe/gofakeit v3.18.0+incompatible h1:wDOmHc9DLG4nRjUVVaxA+CEglKOW72Y5+4WNxUIkjM8=
+github.com/brianvoe/gofakeit v3.18.0+incompatible/go.mod h1:kfwdRA90vvNhPutZWfH7WPaDzUjz+CZFqG+rPkOjGOc=
+github.com/brianvoe/gofakeit/v6 v6.19.0 h1:g+yJ+meWVEsAmR+bV4mNM/eXI0N+0pZ3D+Mi+G5+YQo=
+github.com/brianvoe/gofakeit/v6 v6.19.0/go.mod h1:Ow6qC71xtwm79anlwKRlWZW6zVq9D2XHE4QSSMP/rU8=
+github.com/questdb/go-questdb-client v0.0.0-20220912094445-fa4d7bd7b59e h1:1frUzRjQUh0x9+Y/StyQr85tqzZataSZjJU/a7Z4YSA=
+github.com/questdb/go-questdb-client v0.0.0-20220912094445-fa4d7bd7b59e/go.mod h1:wdHxqNTLLL9teUdnQzwrwlw3dz46kNKlUoDCctn9DU4=
