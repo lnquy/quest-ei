@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"strings"
@@ -12,10 +14,6 @@ import (
 	fake "github.com/brianvoe/gofakeit/v6"
 	"github.com/lnquy/quest-ei/pkg/model"
 	qdb "github.com/questdb/go-questdb-client"
-)
-
-const (
-	senderBufferSizeBytes = 100 * 1024 * 1024 // 100MB
 )
 
 var (
@@ -28,8 +26,12 @@ var (
 	fNoOfTalkGroupsPerSites int
 	fNoOfUnitsPerTalkGroup  int
 	fFlushBatchSize         int
-	fLoadCapacity           float64
-	fToFile                 string
+	fFlushBatchBufferMB     int
+	fMinLoadFactor          float64
+	fMaxLoadFactor          float64
+	fOutMetricsFile         string
+	fOutStaticFile          string
+	fInStaticFile           string
 
 	start    time.Time
 	end      time.Time
@@ -45,9 +47,13 @@ func init() {
 	flag.IntVar(&fNoOfFleetsPerSite, "fleets-per-site", 5, "Number of fleets per site")
 	flag.IntVar(&fNoOfTalkGroupsPerSites, "talk-groups-per-site", 20, "Number of talk groups per site")
 	flag.IntVar(&fNoOfUnitsPerTalkGroup, "units-per-talk-group", 5, "Number of unit per talk group")
-	flag.IntVar(&fFlushBatchSize, "flush-batch-size", 10000, "Number of messages to flush to QuestDB in each batch (max=100000)")
-	flag.Float64Var(&fLoadCapacity, "load", 0.5, `Load capacity of a site. At each "interval", how many "load" units will make a call [0.0-1.0]`)
-	flag.StringVar(&fToFile, "to-file", "", "Optional path to write ILP messages to the file instead of flushing to QuestDB directly")
+	flag.IntVar(&fFlushBatchSize, "flush-batch-size", 10000, "Number of messages to flush to QuestDB in each batch. May need to increase flush-batch-buffer-mb if this value is too big.")
+	flag.IntVar(&fFlushBatchBufferMB, "flush-batch-buffer-mb", 100, "Number of MB memory will be used for buffering. Increase this value if flush-batch-size is too big")
+	flag.Float64Var(&fMinLoadFactor, "min-load", 0.0, `Minimum load factor of a site. At each "interval", at least "minLoadFactor" units will make a call`)
+	flag.Float64Var(&fMaxLoadFactor, "max-load", 1.0, `Maximum load factor of a site. At each "interval", at most "maxLoadFactor" units will make a call`)
+	flag.StringVar(&fOutMetricsFile, "out-metrics-file", "", "Optional path to write ILP messages to the file instead of flushing to QuestDB directly")
+	flag.StringVar(&fOutStaticFile, "out-static-file", "", "Optional path to write static data (sites, channels, fleets, talk groups, units) to JSON the file")
+	flag.StringVar(&fInStaticFile, "in-static-file", "", "Optional path to provide static JSON file. If this is set, no static records will be generated and only call metrics will be generated")
 
 	flag.Parse()
 
@@ -58,18 +64,59 @@ func init() {
 	panicIfError(err, "failed to parse end time from argument")
 	interval, err = time.ParseDuration(fInterval)
 	panicIfError(err, "failed to parse interval from argument")
-	if fFlushBatchSize <= 0 || fFlushBatchSize > 100000 {
-		panic("invalid flush-batch-size argument")
-	}
 }
 
 func main() {
 	startedAt := time.Now()
 	ctx := context.TODO()
-	sender := newQuestDbILPSender(ctx, senderBufferSizeBytes)
+	sender := newQuestDbILPSender(ctx)
 	defer sender.Close()
 
 	sites := make([]*model.Site, 0, fNoOfSites)
+
+	// Init static data (sites, channels, fleets, talk groups, units)
+	if fInStaticFile != "" { // Load from provided file
+		log.Printf("Loading static records from JSON file: %s", fInStaticFile)
+		b, err := ioutil.ReadFile(fInStaticFile)
+		panicIfError(err, "failed to open static records JSON file")
+		panicIfError(json.Unmarshal(b, &sites), "failed to decode static records JSON file")
+		log.Printf("   + Sites: %d", len(sites))
+		log.Printf("   + Channels (%d*%dsites): %d", len(sites[0].Channels), len(sites), len(sites[0].Channels)*len(sites))
+		log.Printf("   + Fleets (%d*%dsites): %d", len(sites[0].Fleets), len(sites), len(sites[0].Fleets)*len(sites))
+		log.Printf("   + TalkGroups (%d*%dsites): %d", len(sites[0].TalkGroups), len(sites), len(sites[0].TalkGroups)*len(sites))
+		log.Printf("   + Units (%d*%dsites): %d", len(sites[0].Units), len(sites), len(sites[0].Units)*len(sites))
+	} else { // or generate newly
+		log.Printf("Generating static records from provided arguments")
+		sites = generateStaticRecords(ctx, sender)
+	}
+	// Save static records to JSON file for later reuse, so we won't have to re-generate it again
+	if fOutStaticFile != "" {
+		b, err := json.Marshal(sites)
+		panicIfError(err, "failed to encode sites to JSON")
+		panicIfError(ioutil.WriteFile(fOutStaticFile, b, 0666), "failed to write static records JSON file")
+		log.Printf("Static records JSON file written to: %s", fOutStaticFile)
+	}
+
+	// Init dynamic data (call metrics)
+	log.Printf("Generating call metrics")
+	sender = newQuestDbILPSender(ctx)
+	generateCallMetrics(ctx, sender, sites)
+
+	log.Printf("Finished in %s", time.Since(startedAt))
+}
+
+func newQuestDbILPSender(ctx context.Context) *qdb.LineSender {
+	s, err := qdb.NewLineSender(ctx,
+		qdb.WithBufferCapacity(fFlushBatchBufferMB*1024*1024),
+	)
+	panicIfError(err, "failed to init QuestDB line sender")
+	return s
+}
+
+func generateStaticRecords(ctx context.Context, s *qdb.LineSender) []*model.Site {
+	sites := make([]*model.Site, 0, fNoOfSites)
+
+	// Generate static records (sites, channels, fleets, talk groups, units)
 	for i := 0; i < fNoOfSites; i++ {
 		siteId := fake.UUID()
 		// Units of a site
@@ -140,32 +187,15 @@ func main() {
 		})
 	}
 
-	initStaticRecords(ctx, sender, sites)
-
-	// Init call metrics
-	log.Printf("Start generating call metrics")
-	generateCallMetrics(ctx, sender, sites)
-
-	log.Printf(" > Finished in %s", time.Since(startedAt))
-}
-
-func newQuestDbILPSender(ctx context.Context, bufferSizeBytes int) *qdb.LineSender {
-	s, err := qdb.NewLineSender(ctx,
-		qdb.WithBufferCapacity(bufferSizeBytes),
-	)
-	panicIfError(err, "failed to init QuestDB line sender")
-	return s
-}
-
-func initStaticRecords(ctx context.Context, s *qdb.LineSender, sites []*model.Site) {
-	nowNs := time.Now().UnixNano()
+	// Flush static records to QuestDB or file
+	ts := start.UnixNano()
 	for _, site := range sites {
 		log.Printf(" > Saving %q (%s) site", site.Name, site.Id)
 		err := s.Table("sites").
 			Symbol("id", site.Id).
 			Symbol("name", site.Name).
 			Int64Column("status", site.Status). // Active
-			At(ctx, nowNs)
+			At(ctx, ts)
 		panicIfError(err, "failed to save sites record")
 
 		// err = s.Table("site_readings").
@@ -185,7 +215,7 @@ func initStaticRecords(ctx context.Context, s *qdb.LineSender, sites []*model.Si
 				Float64Column("tx_freq", channel.TxFrequency).
 				Float64Column("rx_freq", channel.RxFrequency).
 				Int64Column("status", channel.Status).
-				At(ctx, nowNs)
+				At(ctx, ts)
 			panicIfError(err, "failed to save channels record")
 		}
 
@@ -197,7 +227,7 @@ func initStaticRecords(ctx context.Context, s *qdb.LineSender, sites []*model.Si
 				Symbol("site_id", fleet.SiteId).
 				Symbol("name", fleet.Name).
 				Int64Column("status", fleet.Status).
-				At(ctx, nowNs)
+				At(ctx, ts)
 			panicIfError(err, "failed to save fleets record")
 		}
 
@@ -210,7 +240,7 @@ func initStaticRecords(ctx context.Context, s *qdb.LineSender, sites []*model.Si
 				Symbol("fleet_id", talkGroup.FleetId).
 				Symbol("name", talkGroup.Name).
 				Int64Column("status", talkGroup.Status).
-				At(ctx, nowNs)
+				At(ctx, ts)
 			panicIfError(err, "failed to save talk_groups record")
 		}
 
@@ -223,13 +253,15 @@ func initStaticRecords(ctx context.Context, s *qdb.LineSender, sites []*model.Si
 				Symbol("talk_group_id", units.TalkGroupId).
 				Symbol("name", units.Name).
 				Int64Column("status", units.Status).
-				At(ctx, nowNs)
+				At(ctx, ts)
 			panicIfError(err, "failed to save units record")
 		}
 
-		s = flushILPMessages(ctx, s)
-		log.Printf(" Saved %q site", site.Name)
+		s = flushILPMessages(ctx, *s)
+		log.Printf("   Saved %q site", site.Name)
 	}
+
+	return sites
 }
 
 func generateCallMetrics(ctx context.Context, s *qdb.LineSender, sites []*model.Site) {
@@ -239,24 +271,24 @@ func generateCallMetrics(ctx context.Context, s *qdb.LineSender, sites []*model.
 		for _, site := range sites {
 			var unit *model.Unit
 
-			// For each "interval", only "loadCapacity" units will make a call
-			// riggedLoad simulates relative loads around the fLoadCapacity (+-10%)
-			riggedLoad := fLoadCapacity + fake.Float64Range(-0.1, 0.1)
-			if riggedLoad < 0.0 {
-				riggedLoad = 0.0
-			}
-			if riggedLoad > 1 {
-				riggedLoad = 1.0
-			}
-			unitCalls := int(float64(len(site.Units)) * riggedLoad)
+			// For each "interval", only "loadFactor" units will make a call
+			// This randomization simulates different load on each system at a time
+			loadFactor := fake.Float64Range(fMinLoadFactor, fMaxLoadFactor)
+			unitCalls := int(float64(len(site.Units)) * loadFactor)
 			for j := 0; j < unitCalls; j++ {
-				unit = site.Units[fake.IntRange(0, len(site.Units)-1)] // Randomly pick a unit
+				unit = site.Units[fake.IntRange(0, len(site.Units)-1)]                 // Randomly pick a unit
+				talkGroup := site.TalkGroups[fake.IntRange(0, len(site.TalkGroups)-1)] // Randomly pick a talkGroup
+				endedAt := fake.DateRange(start, start.Add(15*time.Minute))
 				calls = append(calls, &model.Call{
-					// Id:                     fake.UUID(),
+					Id:                     fake.UUID(),
 					SiteId:                 site.Id,
+					ChannelId:              site.Channels[fake.IntRange(0, len(site.Channels)-1)].Id, // Randomly pick a channel
+					FleetId:                talkGroup.FleetId,
 					SourceUnitId:           unit.Id,
-					DestinationTalkGroupId: site.TalkGroups[fake.IntRange(0, len(site.TalkGroups)-1)].Id, // Randomly call to a talkGroup
+					DestinationTalkGroupId: talkGroup.Id,
 					StartedAt:              start,
+					EndedAt:                endedAt, // Randomize call duration, at most 15m
+					DurationSecond:         int64(endedAt.Sub(start).Seconds()),
 				})
 			}
 
@@ -267,15 +299,19 @@ func generateCallMetrics(ctx context.Context, s *qdb.LineSender, sites []*model.
 			log.Printf(" > Flushing %d call metrics: start=%s, end=%s", len(calls), start.Format(time.RFC3339), end.Format(time.RFC3339))
 			for _, c := range calls {
 				err := s.Table("calls").
-					// Symbol("id", c.Id).
 					Symbol("site_id", c.SiteId).
+					Symbol("channel_id", c.ChannelId).
+					Symbol("fleet_id", c.FleetId).
 					Symbol("source_unit_id", c.SourceUnitId).
 					Symbol("destination_talk_group_id", c.DestinationTalkGroupId).
-					TimestampColumn("started_at", start.UnixNano()).
-					At(ctx, start.UnixNano())
+					StringColumn("id", c.Id).
+					TimestampColumn("started_at", c.StartedAt.UnixNano()).
+					TimestampColumn("ended_at", c.EndedAt.UnixNano()).
+					Int64Column("duration_sec", c.DurationSecond).
+					At(ctx, c.StartedAt.UnixNano())
 				panicIfError(err, "failed to save calls record")
 			}
-			s = flushILPMessages(ctx, s)
+			s = flushILPMessages(ctx, *s)
 			totalCalls += len(calls)
 			log.Printf("   + %d call metrics saved, totalSaved=%d", len(calls), totalCalls)
 			calls = make([]*model.Call, 0, fFlushBatchSize) // Reset batch
@@ -291,34 +327,38 @@ func generateCallMetrics(ctx context.Context, s *qdb.LineSender, sites []*model.
 	log.Printf(" > Flushing %d final call metrics", len(calls))
 	for _, c := range calls {
 		err := s.Table("calls").
-			// Symbol("id", c.Id).
 			Symbol("site_id", c.SiteId).
+			Symbol("channel_id", c.ChannelId).
+			Symbol("fleet_id", c.FleetId).
 			Symbol("source_unit_id", c.SourceUnitId).
 			Symbol("destination_talk_group_id", c.DestinationTalkGroupId).
+			StringColumn("id", c.Id).
 			TimestampColumn("started_at", c.StartedAt.UnixNano()).
+			TimestampColumn("ended_at", c.EndedAt.UnixNano()).
+			Int64Column("duration_sec", c.DurationSecond).
 			At(ctx, c.StartedAt.UnixNano())
 		panicIfError(err, "failed to save calls record")
 	}
-	s = flushILPMessages(ctx, s)
+	s = flushILPMessages(ctx, *s)
 	totalCalls += len(calls)
 	log.Printf("   + %d final call metrics saved, totalSaved=%d", len(calls), totalCalls)
 }
 
-func flushILPMessages(ctx context.Context, s *qdb.LineSender) *qdb.LineSender {
-	if fToFile == "" {
+func flushILPMessages(ctx context.Context, s qdb.LineSender) *qdb.LineSender {
+	if fOutMetricsFile == "" {
 		panicIfError(s.Flush(ctx), "failed to flush ILP messages to QuestDB")
-		return s
+		return &s
 	}
 
 	// Write ILP to file instead of flushing to QuestDB directly.
 	// This file then can be used on `tsbs_load_questdb --file qdb-data.ilp --workers 4`
-	f, err := os.OpenFile(fToFile, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
+	f, err := os.OpenFile(fOutMetricsFile, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
 	panicIfError(err, "failed to open file to write")
 	defer f.Close()
 	_, err = f.WriteString(s.Messages())
 	panicIfError(err, "failed to write ILP messages to file")
 	_ = s.Close() // Close to remove all buffered messages first
-	return newQuestDbILPSender(ctx, senderBufferSizeBytes)
+	return newQuestDbILPSender(ctx)
 }
 
 func panicIfError(err error, msg string) {

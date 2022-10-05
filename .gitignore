@@ -24,3 +24,4 @@ quest-ei
 
 # Generated ILP metrics
 *.ilp
+*.json
