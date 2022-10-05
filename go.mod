@@ -7,4 +7,7 @@ require (
 	github.com/questdb/go-questdb-client v0.0.0-20220912094445-fa4d7bd7b59e
 )
 
-require github.com/brianvoe/gofakeit v3.18.0+incompatible // indirect
+require (
+	github.com/brianvoe/gofakeit v3.18.0+incompatible // indirect
+	golang.org/x/text v0.3.7 // indirect
+)

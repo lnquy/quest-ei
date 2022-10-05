@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	fake "github.com/brianvoe/gofakeit/v6"
@@ -101,21 +102,25 @@ func main() {
 		// TalkGroups of a site
 		talkGroups := make([]*model.TalkGroup, 0, fNoOfTalkGroupsPerSites)
 		for j := 0; j < fNoOfTalkGroupsPerSites; j++ {
+			tgName := fake.Word()
+			tgName = strings.ToUpper(string(tgName[0])) + tgName[1:]
 			talkGroup := model.TalkGroup{
 				Id:      fake.UUID(),
 				SiteId:  siteId,
 				FleetId: fleets[fake.IntRange(0, len(fleets)-1)].Id, // Randomly assign talk group to a fleet
-				Name:    "TalkGroup#" + fake.Word(),
+				Name:    "TalkGroup#" + tgName,
 				Status:  model.StatusActive,
 			}
 
 			// Units per talk group
 			for k := 0; k < fNoOfUnitsPerTalkGroup; k++ {
+				unitName := fake.LoremIpsumWord()
+				unitName = strings.ToUpper(string(unitName[0])) + unitName[1:]
 				units = append(units, &model.Unit{
 					Id:          fake.UUID(),
 					SiteId:      siteId,
 					TalkGroupId: talkGroup.Id,
-					Name:        "Unit#" + fake.SafeColor(),
+					Name:        "Unit#" + unitName,
 					Status:      model.StatusActive,
 				})
 			}
@@ -247,7 +252,7 @@ func generateCallMetrics(ctx context.Context, s *qdb.LineSender, sites []*model.
 			for j := 0; j < unitCalls; j++ {
 				unit = site.Units[fake.IntRange(0, len(site.Units)-1)] // Randomly pick a unit
 				calls = append(calls, &model.Call{
-					Id:                     fake.UUID(),
+					// Id:                     fake.UUID(),
 					SiteId:                 site.Id,
 					SourceUnitId:           unit.Id,
 					DestinationTalkGroupId: site.TalkGroups[fake.IntRange(0, len(site.TalkGroups)-1)].Id, // Randomly call to a talkGroup
@@ -262,7 +267,7 @@ func generateCallMetrics(ctx context.Context, s *qdb.LineSender, sites []*model.
 			log.Printf(" > Flushing %d call metrics: start=%s, end=%s", len(calls), start.Format(time.RFC3339), end.Format(time.RFC3339))
 			for _, c := range calls {
 				err := s.Table("calls").
-					Symbol("id", c.Id).
+					// Symbol("id", c.Id).
 					Symbol("site_id", c.SiteId).
 					Symbol("source_unit_id", c.SourceUnitId).
 					Symbol("destination_talk_group_id", c.DestinationTalkGroupId).
@@ -286,7 +291,7 @@ func generateCallMetrics(ctx context.Context, s *qdb.LineSender, sites []*model.
 	log.Printf(" > Flushing %d final call metrics", len(calls))
 	for _, c := range calls {
 		err := s.Table("calls").
-			Symbol("id", c.Id).
+			// Symbol("id", c.Id).
 			Symbol("site_id", c.SiteId).
 			Symbol("source_unit_id", c.SourceUnitId).
 			Symbol("destination_talk_group_id", c.DestinationTalkGroupId).
