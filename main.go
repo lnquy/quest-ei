@@ -81,10 +81,10 @@ func main() {
 		panicIfError(err, "failed to open static records JSON file")
 		panicIfError(json.Unmarshal(b, &sites), "failed to decode static records JSON file")
 		log.Printf("   + Sites: %d", len(sites))
-		log.Printf("   + Channels (%d*%dsites): %d", len(sites[0].Channels), len(sites), len(sites[0].Channels)*len(sites))
-		log.Printf("   + Fleets (%d*%dsites): %d", len(sites[0].Fleets), len(sites), len(sites[0].Fleets)*len(sites))
-		log.Printf("   + TalkGroups (%d*%dsites): %d", len(sites[0].TalkGroups), len(sites), len(sites[0].TalkGroups)*len(sites))
-		log.Printf("   + Units (%d*%dsites): %d", len(sites[0].Units), len(sites), len(sites[0].Units)*len(sites))
+		log.Printf("   + Channels (%d*%dsites): ~%d", len(sites[0].Channels), len(sites), len(sites[0].Channels)*len(sites))
+		log.Printf("   + Fleets (%d*%dsites): ~%d", len(sites[0].Fleets), len(sites), len(sites[0].Fleets)*len(sites))
+		log.Printf("   + TalkGroups (%d*%dsites): ~%d", len(sites[0].TalkGroups), len(sites), len(sites[0].TalkGroups)*len(sites))
+		log.Printf("   + Units (%d*%dsites): ~%d", len(sites[0].Units), len(sites), len(sites[0].Units)*len(sites))
 	} else { // or generate newly
 		log.Printf("Generating static records from provided arguments")
 		sites = generateStaticRecords(ctx, sender)
@@ -121,10 +121,18 @@ func generateStaticRecords(ctx context.Context, s *qdb.LineSender) []*model.Site
 		siteId := fake.UUID()
 		// Units of a site
 		units := make([]*model.Unit, 0, fNoOfUnitsPerTalkGroup*fNoOfTalkGroupsPerSites)
+		poorSite := false
+		if fake.Float64Range(0, 1.0) < 0.1 { // 10% sites
+			poorSite = true
+		}
 
 		// Fleets of a site
 		fleets := make([]*model.Fleet, 0, fNoOfFleetsPerSite)
+		poorFleetRate := fake.Float64Range(0, 0.1)
 		for j := 0; j < fNoOfFleetsPerSite; j++ {
+			if poorSite && fake.Float64Range(0.0, 1.0) < poorFleetRate { // poorSite has 0%-10% less fleets
+				continue
+			}
 			fleets = append(fleets, &model.Fleet{
 				Id:     fake.UUID(),
 				SiteId: siteId,
@@ -135,7 +143,11 @@ func generateStaticRecords(ctx context.Context, s *qdb.LineSender) []*model.Site
 
 		// Channels of a site
 		channels := make([]*model.Channel, 0, fNoOfChannelsPerSite)
+		poorChannelRate := fake.Float64Range(0, 0.1)
 		for j := 0; j < fNoOfChannelsPerSite; j++ {
+			if poorSite && fake.Float64Range(0.0, 1.0) < poorChannelRate { // poorSite has 0%-10% less channels
+				continue
+			}
 			channels = append(channels, &model.Channel{
 				Id:          fake.UUID(),
 				SiteId:      siteId,
@@ -148,7 +160,11 @@ func generateStaticRecords(ctx context.Context, s *qdb.LineSender) []*model.Site
 
 		// TalkGroups of a site
 		talkGroups := make([]*model.TalkGroup, 0, fNoOfTalkGroupsPerSites)
+		poorTgRate := fake.Float64Range(0, 0.15)
 		for j := 0; j < fNoOfTalkGroupsPerSites; j++ {
+			if poorSite && fake.Float64Range(0.0, 1.0) < poorTgRate { // poorSite has 0%-15% less tgs
+				continue
+			}
 			tgName := fake.Word()
 			tgName = strings.ToUpper(string(tgName[0])) + tgName[1:]
 			talkGroup := model.TalkGroup{
@@ -160,7 +176,11 @@ func generateStaticRecords(ctx context.Context, s *qdb.LineSender) []*model.Site
 			}
 
 			// Units per talk group
+			poorUnitRate := fake.Float64Range(0, 0.2)
 			for k := 0; k < fNoOfUnitsPerTalkGroup; k++ {
+				if poorSite && fake.Float64Range(0.0, 1.0) < poorUnitRate { // poorSite has 0%-20% less units
+					continue
+				}
 				unitName := fake.LoremIpsumWord()
 				unitName = strings.ToUpper(string(unitName[0])) + unitName[1:]
 				units = append(units, &model.Unit{
@@ -270,12 +290,22 @@ func generateCallMetrics(ctx context.Context, s *qdb.LineSender, sites []*model.
 	for start.Before(end) {
 		for _, site := range sites {
 			var unit *model.Unit
-
 			// For each "interval", only "loadFactor" units will make a call
 			// This randomization simulates different load on each system at a time
 			loadFactor := fake.Float64Range(fMinLoadFactor, fMaxLoadFactor)
+			startSec := start.Hour()*3600 + start.Minute()*60 + start.Second()
+			if startSec >= (14*3600+0*60+0) && startSec <= (24*3600+0*60+0) {
+				// During low load duration [14:00, 24:00], the loadFactor is lower than normal
+				loadFactor *= fake.Float64Range(0, 0.5)
+			}
 			unitCalls := int(float64(len(site.Units)) * loadFactor)
+			isLowLoadSite := fake.Float64Range(0, 1.0) < 0.3 // 30% chance to be a low load site
+			lowLoadSkipRate := fake.Float64Range(0, 0.5)     // Chance to drop a call on low load site
 			for j := 0; j < unitCalls; j++ {
+				if isLowLoadSite && fake.Float64Range(0, 1.0) < lowLoadSkipRate {
+					continue // Randomly skip 0-50% of calls
+				}
+
 				unit = site.Units[fake.IntRange(0, len(site.Units)-1)]                 // Randomly pick a unit
 				talkGroup := site.TalkGroups[fake.IntRange(0, len(site.TalkGroups)-1)] // Randomly pick a talkGroup
 				endedAt := fake.DateRange(start, start.Add(15*time.Minute))
