@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,9 +36,10 @@ var (
 	fInStaticFile           string
 	fIsLive                 bool
 
-	start    time.Time
-	end      time.Time
-	interval time.Duration
+	start         time.Time
+	end           time.Time
+	interval      time.Duration
+	uniqueNameMap map[string]int
 )
 
 func init() {
@@ -68,6 +69,8 @@ func init() {
 	panicIfError(err, "failed to parse end time from argument")
 	interval, err = time.ParseDuration(fInterval)
 	panicIfError(err, "failed to parse interval from argument")
+
+	uniqueNameMap = make(map[string]int, 5000)
 }
 
 func main() {
@@ -158,7 +161,7 @@ func generateStaticRecords(ctx context.Context, s *qdb.LineSender) []*model.Site
 			fleets = append(fleets, &model.Fleet{
 				Id:     fake.UUID(),
 				SiteId: siteId,
-				Name:   "Fleet#" + fake.CountryAbr(),
+				Name:   "Fleet#" + getUniqueName(fake.CountryAbr),
 				Status: model.StatusActive,
 			})
 		}
@@ -173,7 +176,7 @@ func generateStaticRecords(ctx context.Context, s *qdb.LineSender) []*model.Site
 			channels = append(channels, &model.Channel{
 				Id:          fake.UUID(),
 				SiteId:      siteId,
-				Name:        fmt.Sprintf("Channel#%d", j),
+				Name:        "Channel#" + getUniqueName(fake.Noun),
 				TxFrequency: fake.Float64(),
 				RxFrequency: fake.Float64(),
 				Status:      model.StatusActive,
@@ -187,13 +190,11 @@ func generateStaticRecords(ctx context.Context, s *qdb.LineSender) []*model.Site
 			if poorSite && fake.Float64Range(0.0, 1.0) < poorTgRate { // poorSite has 0%-15% less tgs
 				continue
 			}
-			tgName := fake.Word()
-			tgName = strings.ToUpper(string(tgName[0])) + tgName[1:]
 			talkGroup := model.TalkGroup{
 				Id:      fake.UUID(),
 				SiteId:  siteId,
 				FleetId: fleets[fake.IntRange(0, len(fleets)-1)].Id, // Randomly assign talk group to a fleet
-				Name:    "TalkGroup#" + tgName,
+				Name:    "TalkGroup#" + getUniqueName(fake.LoremIpsumWord),
 				Status:  model.StatusActive,
 			}
 
@@ -203,13 +204,11 @@ func generateStaticRecords(ctx context.Context, s *qdb.LineSender) []*model.Site
 				if poorSite && fake.Float64Range(0.0, 1.0) < poorUnitRate { // poorSite has 0%-20% less units
 					continue
 				}
-				unitName := fake.LoremIpsumWord()
-				unitName = strings.ToUpper(string(unitName[0])) + unitName[1:]
 				units = append(units, &model.Unit{
 					Id:          fake.UUID(),
 					SiteId:      siteId,
 					TalkGroupId: talkGroup.Id,
-					Name:        "Unit#" + unitName,
+					Name:        "Unit#" + getUniqueName(fake.Word),
 					Status:      model.StatusActive,
 				})
 			}
@@ -220,7 +219,7 @@ func generateStaticRecords(ctx context.Context, s *qdb.LineSender) []*model.Site
 		// Site
 		sites = append(sites, &model.Site{
 			Id:         siteId,
-			Name:       "Site#" + fake.Fruit(),
+			Name:       "Site#" + getUniqueName(fake.Fruit),
 			Status:     model.StatusActive,
 			Channels:   channels,
 			Fleets:     fleets,
@@ -397,12 +396,12 @@ func generateCallMetrics(ctx context.Context, s *qdb.LineSender, sites []*model.
 }
 
 func generateLiveCallMetrics(ctx context.Context, s *qdb.LineSender, sites []*model.Site) {
-	calls := make([]*model.Call, 0, fFlushBatchSize)
 	totalCalls := 0
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	ingestMetricFunc := func(now time.Time) {
+		calls := make([]*model.Call, 0, fFlushBatchSize)
 		// Generating
 		for _, site := range sites {
 			var unit *model.Unit
@@ -508,6 +507,25 @@ func flushILPMessages(ctx context.Context, s qdb.LineSender) *qdb.LineSender {
 	panicIfError(err, "failed to write ILP messages to file")
 	_ = s.Close() // Close to remove all buffered messages first
 	return newQuestDbILPSender(ctx)
+}
+
+func getUniqueName(nameFunc func() string) string {
+	name := nameFunc()
+	if name == "" {
+		return fake.UUID()
+	}
+	if len(name) == 1 {
+		return name + strconv.Itoa(int(fake.Int64()))
+	}
+	name = strings.ReplaceAll(name, " ", "_")
+	name = strings.ToUpper(string(name[0])) + name[1:]
+	count, ok := uniqueNameMap[name]
+	if ok {
+		uniqueNameMap[name] = 1
+		return name
+	}
+	uniqueNameMap[name] = count + 1
+	return name + strconv.Itoa(count)
 }
 
 func panicIfError(err error, msg string) {

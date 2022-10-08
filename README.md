@@ -63,7 +63,7 @@ $ quest-ei \
   --flush-batch-size=1000000 \
   --flush-batch-buffer-mb=500 \
   --in-static-file=qdb-static.json \
-  --live &
+  --live
 ```
 
 #### Help
