@@ -8,7 +8,9 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
 	"time"
 
 	fake "github.com/brianvoe/gofakeit/v6"
@@ -32,6 +34,7 @@ var (
 	fOutMetricsFile         string
 	fOutStaticFile          string
 	fInStaticFile           string
+	fIsLive                 bool
 
 	start    time.Time
 	end      time.Time
@@ -54,6 +57,7 @@ func init() {
 	flag.StringVar(&fOutMetricsFile, "out-metrics-file", "", "Optional path to write ILP messages to the file instead of flushing to QuestDB directly")
 	flag.StringVar(&fOutStaticFile, "out-static-file", "", "Optional path to write static data (sites, channels, fleets, talk groups, units) to JSON the file")
 	flag.StringVar(&fInStaticFile, "in-static-file", "", "Optional path to provide static JSON file. If this is set, no static records will be generated and only call metrics will be generated")
+	flag.BoolVar(&fIsLive, "live", false, "Generate the data in real time")
 
 	flag.Parse()
 
@@ -67,7 +71,10 @@ func init() {
 }
 
 func main() {
-	startedAt := time.Now()
+	defer func(t time.Time) {
+		log.Printf("Finished in %s", time.Since(t))
+	}(time.Now())
+
 	ctx := context.TODO()
 	sender := newQuestDbILPSender(ctx)
 	defer sender.Close()
@@ -98,11 +105,26 @@ func main() {
 	}
 
 	// Init dynamic data (call metrics)
-	log.Printf("Generating call metrics")
 	sender = newQuestDbILPSender(ctx)
-	generateCallMetrics(ctx, sender, sites)
+	if !fIsLive {
+		log.Printf("Generating call metrics")
+		generateCallMetrics(ctx, sender, sites)
+		return
+	}
 
-	log.Printf("Finished in %s", time.Since(startedAt))
+	// Generate live metrics
+	var ctxCancel context.CancelFunc
+	ctx, ctxCancel = signal.NotifyContext(ctx, os.Interrupt, os.Kill)
+	defer ctxCancel()
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	log.Printf("Generating realtime call metrics in live mode")
+	// Running in background until process is interrupted
+	go func() {
+		defer wg.Done()
+		generateLiveCallMetrics(ctx, sender, sites)
+	}()
+	wg.Wait()
 }
 
 func newQuestDbILPSender(ctx context.Context) *qdb.LineSender {
@@ -372,6 +394,103 @@ func generateCallMetrics(ctx context.Context, s *qdb.LineSender, sites []*model.
 	s = flushILPMessages(ctx, *s)
 	totalCalls += len(calls)
 	log.Printf("   + %d final call metrics saved, totalSaved=%d", len(calls), totalCalls)
+}
+
+func generateLiveCallMetrics(ctx context.Context, s *qdb.LineSender, sites []*model.Site) {
+	calls := make([]*model.Call, 0, fFlushBatchSize)
+	totalCalls := 0
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	ingestMetricFunc := func(now time.Time) {
+		// Generating
+		for _, site := range sites {
+			var unit *model.Unit
+			// For each "interval", only "loadFactor" units will make a call
+			loadFactor := fake.Float64Range(fMinLoadFactor, fMaxLoadFactor)
+			unitCalls := int(float64(len(site.Units)) * loadFactor)
+			isLowLoadSite := fake.Float64Range(0, 1.0) < 0.3 // 30% chance to be a low load site
+			lowLoadSkipRate := fake.Float64Range(0, 0.5)     // Chance to drop a call on low load site
+			for j := 0; j < unitCalls; j++ {
+				if isLowLoadSite && fake.Float64Range(0, 1.0) < lowLoadSkipRate {
+					continue // Randomly skip 0-50% of calls
+				}
+
+				unit = site.Units[fake.IntRange(0, len(site.Units)-1)]                 // Randomly pick a unit
+				talkGroup := site.TalkGroups[fake.IntRange(0, len(site.TalkGroups)-1)] // Randomly pick a talkGroup
+				endedAt := fake.DateRange(now, now.Add(5*time.Minute))
+				calls = append(calls, &model.Call{
+					Id:                     fake.UUID(),
+					SiteId:                 site.Id,
+					ChannelId:              site.Channels[fake.IntRange(0, len(site.Channels)-1)].Id, // Randomly pick a channel
+					FleetId:                talkGroup.FleetId,
+					SourceUnitId:           unit.Id,
+					DestinationTalkGroupId: talkGroup.Id,
+					StartedAt:              now,
+					EndedAt:                endedAt, // Randomize call duration, at most 5m
+					DurationSecond:         int64(endedAt.Sub(now).Seconds()),
+				})
+			}
+
+			if len(calls) <= fFlushBatchSize {
+				continue
+			}
+
+			log.Printf(" > Flushing %d call metrics at: %s", len(calls), now.Format(time.RFC3339))
+			for _, c := range calls {
+				err := s.Table("calls").
+					Symbol("site_id", c.SiteId).
+					Symbol("channel_id", c.ChannelId).
+					Symbol("fleet_id", c.FleetId).
+					Symbol("source_unit_id", c.SourceUnitId).
+					Symbol("destination_talk_group_id", c.DestinationTalkGroupId).
+					StringColumn("id", c.Id).
+					TimestampColumn("started_at", c.StartedAt.UnixNano()).
+					TimestampColumn("ended_at", c.EndedAt.UnixNano()).
+					Int64Column("duration_sec", c.DurationSecond).
+					At(ctx, c.StartedAt.UnixNano())
+				panicIfError(err, "failed to save calls record")
+			}
+			s = flushILPMessages(ctx, *s)
+			totalCalls += len(calls)
+			log.Printf("   + %d call metrics saved, totalSaved=%d", len(calls), totalCalls)
+			calls = make([]*model.Call, 0, fFlushBatchSize) // Reset batch
+		}
+
+		// Ingest
+		if len(calls) == 0 {
+			return
+		}
+		// Last flush
+		log.Printf(" > Flushing %d final call metrics at: %s", len(calls), now.Format(time.RFC3339))
+		for _, c := range calls {
+			err := s.Table("calls").
+				Symbol("site_id", c.SiteId).
+				Symbol("channel_id", c.ChannelId).
+				Symbol("fleet_id", c.FleetId).
+				Symbol("source_unit_id", c.SourceUnitId).
+				Symbol("destination_talk_group_id", c.DestinationTalkGroupId).
+				StringColumn("id", c.Id).
+				TimestampColumn("started_at", c.StartedAt.UnixNano()).
+				TimestampColumn("ended_at", c.EndedAt.UnixNano()).
+				Int64Column("duration_sec", c.DurationSecond).
+				At(ctx, c.StartedAt.UnixNano())
+			panicIfError(err, "failed to save calls record")
+		}
+		s = flushILPMessages(ctx, *s)
+		totalCalls += len(calls)
+		log.Printf("   + %d final call metrics saved, totalSaved=%d", len(calls), totalCalls)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf(" > context canceled, stopping the background live call metrics generation")
+			return
+		case now := <-ticker.C:
+			ingestMetricFunc(now)
+		}
+	}
 }
 
 func flushILPMessages(ctx context.Context, s qdb.LineSender) *qdb.LineSender {
