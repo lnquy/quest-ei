@@ -525,7 +525,7 @@ func getUniqueName(nameFunc func() string) string {
 		return name
 	}
 	uniqueNameMap[name] = count + 1
-	return name + strconv.Itoa(count)
+	return name + strconv.Itoa(count+1)
 }
 
 func panicIfError(err error, msg string) {
